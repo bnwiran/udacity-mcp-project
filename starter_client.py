@@ -507,17 +507,34 @@ Remember: Just because multiple queries are about similar topics doesn't mean th
             print("=" * 50)
 
             print("\nPricing Plans:")
-            # The result.content is a list with one item, a dict, where the 'text' key holds the rows
+            # The result.content is a list of content blocks
             if pricing.content and len(pricing.content) > 0:
-                for plan in pricing.content[0]["text"]:
-                    print(
-                        f"  • {plan['company_name']}: {plan['plan_name']} - Input Token ${plan['input_tokens']}, Output Tokens ${plan['output_tokens']}")
+                # Access the text attribute of the first content block
+                result_text = pricing.content[0].text if hasattr(pricing.content[0], 'text') else str(
+                    pricing.content[0])
+
+                # Parse the result if it's JSON
+                try:
+                    import json
+                    plans = json.loads(result_text) if isinstance(result_text, str) else result_text
+
+                    if isinstance(plans, list) and len(plans) > 0:
+                        for plan in plans:
+                            print(
+                                f"  • {plan['company_name']}: {plan['plan_name']} - Input Token ${plan['input_tokens']}, Output Tokens ${plan['output_tokens']}")
+                    else:
+                        print("  No data stored yet")
+                except json.JSONDecodeError:
+                    # If not JSON, just print the raw result
+                    print(f"  {result_text}")
             else:
                 print("  No data stored yet")
 
             print("=" * 50)
         except Exception as e:
             print(f"Error showing data: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def start(self) -> None:
         """Main chat session handler."""
