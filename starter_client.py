@@ -8,7 +8,6 @@ from typing import Any, List, Dict, TypedDict
 from datetime import datetime, timedelta
 from pathlib import Path
 import re
-import ast
 
 from dotenv import load_dotenv
 from anthropic import Anthropic
@@ -53,9 +52,18 @@ class Configuration:
             JSONDecodeError: If configuration file is invalid JSON.
             ValueError: If configuration file is missing required fields.
         """
-        # complete
-        with open(file_path, "r") as f:
-            return json.load(f)
+        try:
+            with open(file_path, 'r') as f:
+                config = json.load(f)
+
+            if "mcpServers" not in config:
+                raise ValueError("Configuration file is missing required 'mcpServers' field")
+
+            return config
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Configuration file not found: {file_path}")
+        except json.JSONDecodeError as e:
+            raise json.JSONDecodeError(f"Invalid JSON in configuration file: {e}", e.doc, e.pos)
 
     @property
     def anthropic_api_key(self) -> str:
@@ -92,8 +100,8 @@ class Server:
         # complete params
         server_params = StdioServerParameters(
             command=command,
-            args=self.config['args'],
-            env={**os.environ, **self.config["env"]} if self.config.get("env") else None
+            args=self.config["args"],
+            env={**os.environ, **self.config["env"]} if self.config.get("env") else None,
         )
         try:
             stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
@@ -116,16 +124,19 @@ class Server:
         Raises:
             RuntimeError: If the server is not initialized.
         """
-        # complete
         if not self.session:
-            raise RuntimeError(f"Server {self.name} not initialized")
+            raise RuntimeError(f"Server {self.name} is not initialized")
 
         tools_response = await self.session.list_tools()
         tools = []
 
-        for item in tools_response:
-            if isinstance(item, tuple) and item[0] == "tools":
-                tools.extend(ToolDefinition(name=tool.name, description=tool.description, input_schema=tool.inputSchema) for tool in item[1])
+        for tool in tools_response.tools:
+            tool_def: ToolDefinition = {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.inputSchema
+            }
+            tools.append(tool_def)
 
         return tools
 
@@ -151,26 +162,24 @@ class Server:
             RuntimeError: If server is not initialized.
             Exception: If tool execution fails after all retries.
         """
-        # complete
         if not self.session:
-            raise RuntimeError(f"Server {self.name} not initialized")
+            raise RuntimeError(f"Server {self.name} is not initialized")
 
-        attempt = 0
-        while attempt < retries:
+        for attempt in range(retries + 1):
             try:
                 logging.info(f"Executing {tool_name}...")
-                result = await self.session.call_tool(name=tool_name, arguments=arguments, read_timeout_seconds=timedelta(seconds=60))
-
+                result = await self.session.call_tool(
+                    name=tool_name,
+                    arguments=arguments,
+                    read_timeout_seconds=timedelta(seconds=60)
+                )
                 return result
-
             except Exception as e:
-                attempt += 1
-                logging.warning(f"Error executing tool: {e}. Attempt {attempt} of {retries}.")
                 if attempt < retries:
-                    logging.info(f"Retrying in {delay} seconds...")
+                    logging.warning(f"Tool execution failed (attempt {attempt + 1}/{retries + 1}): {e}")
                     await asyncio.sleep(delay)
                 else:
-                    logging.error("Max retries reached. Failing.")
+                    logging.error(f"Tool execution failed after {retries + 1} attempts: {e}")
                     raise
 
     async def cleanup(self) -> None:
@@ -244,9 +253,9 @@ class DataExtractor:
         try:
             extraction_prompt = f"""
             Analyze this text and extract pricing information in JSON format:
-            
+
             Text: {llm_response}
-            
+
             Extract pricing plans with this structure:
             {{
                 "company_name": "company name",
@@ -263,7 +272,7 @@ class DataExtractor:
                     }}
                 ]
             }}
-            
+
             Return only valid JSON, no other text. Do not return your response enclosed in ```json```
             """
 
@@ -272,21 +281,20 @@ class DataExtractor:
             pricing_data = json.loads(extraction_response)
 
             for plan in pricing_data.get("plans", []):
-            # complete
                 await self.sqlite_server.execute_tool("write_query", {
                     "query": f"""
-                        INSERT INTO pricing_plans (company_name, plan_name, input_tokens, output_tokens, currency, billing_period, features, limitations, source_query)
-                        VALUES (
-                            '{pricing_data.get("company_name", "Unknown")}',
-                            '{plan.get("plan_name", "Unknown Plan")}',
-                            '{plan.get("input_tokens", 0)}',
-                            '{plan.get("output_tokens", 0)}',
-                            '{plan.get("currency", "USD")}',
-                            '{plan.get("billing_period", "unknown")}',
-                            '{json.dumps(plan.get("features", []))}',
-                            '{plan.get("limitations", "")}',
-                            '{user_query}')
-                        """
+                    INSERT INTO pricing_plans (company_name, plan_name, input_tokens, output_tokens, currency, billing_period, features, limitations, source_query)
+                    VALUES (
+                        '{pricing_data.get("company_name", "Unknown")}',
+                        '{plan.get("plan_name", "Unknown Plan")}',
+                        '{plan.get("input_tokens", 0)}',
+                        '{plan.get("output_tokens", 0)}',
+                        '{plan.get("currency", "USD")}',
+                        '{plan.get("billing_period", "unknown")}',
+                        '{json.dumps(plan.get("features", []))}',
+                        '{plan.get("limitations", "")}',
+                        '{user_query}')
+                    """
                 })
 
             logger.info(f"Stored {len(pricing_data.get('plans', []))} pricing plans")
@@ -298,6 +306,19 @@ class DataExtractor:
 class ChatSession:
     """Orchestrates the interaction between user, LLM, and tools."""
 
+    # System prompt to guide LLM behavior
+    SYSTEM_PROMPT = """You are a helpful assistant that answers questions directly and accurately.
+
+Important guidelines:
+- Answer each question based on what is specifically asked
+- DO NOT compare information from previous responses unless explicitly asked to compare
+- When asked about pricing for a service, provide that specific information only
+- Only perform comparisons when the user explicitly uses words like "compare", "versus", "vs", "difference between", etc.
+- Maintain context from previous queries but don't automatically relate or compare them
+- If you need information, use the available tools to fetch it
+
+Remember: Just because multiple queries are about similar topics doesn't mean they should be compared."""
+
     def __init__(self, servers: list[Server], api_key: str) -> None:
         self.servers: list[Server] = servers
         self.anthropic = Anthropic(base_url="https://claude.vocareum.com", api_key=api_key)
@@ -306,6 +327,7 @@ class ChatSession:
         self.sqlite_server: Server | None = None
         self.data_extractor: DataExtractor | None = None
         self.model_name = 'claude-haiku-4-5-20251001'
+        self.conversation_history: List[Dict[str, Any]] = []  # Store conversation history
 
     async def cleanup_servers(self) -> None:
         """Clean up all servers properly."""
@@ -317,49 +339,117 @@ class ChatSession:
 
     async def process_query(self, query: str) -> None:
         """Process a user query and extract/store relevant data."""
-        messages = [{'role': 'user', 'content': query}]
+        # Add the new user query to conversation history
+        self.conversation_history.append({'role': 'user', 'content': query})
+
+        # Use the full conversation history for context
         response = self.anthropic.messages.create(
             max_tokens=2024,
             model=self.model_name,
+            system=self.SYSTEM_PROMPT,
             tools=self.available_tools,
-            messages=messages
+            messages=self.conversation_history.copy()
         )
 
         full_response = ""
         source_url = None
+        final_assistant_content = []
 
         process_query = True
         while process_query:
             assistant_content = []
+
             for content in response.content:
                 if content.type == 'text':
-                    # complete
                     full_response += content.text + "\n"
                     assistant_content.append(content)
+                    # Store for final conversation history
+                    final_assistant_content.append({
+                        'type': 'text',
+                        'text': content.text
+                    })
+
                     if len(response.content) == 1:
+                        print(content.text)
                         process_query = False
 
                 elif content.type == 'tool_use':
-                    # complete
                     assistant_content.append(content)
-                    messages.append({'role': 'assistant', 'content': f'Calling {content.name} tool with arguments: {content.input}'})
-                    tool_name = content.name
-                    arguments = content.input
-                    server_name = self.tool_to_server[tool_name]
-                    for server in self.servers:
-                        if server.name == server_name:
-                            tool_result = await server.execute_tool(tool_name=tool_name, arguments=arguments)
-                            tool_result_content = "\n".join([cnt.text for cnt in tool_result.content])
-                            messages.append({'role': 'assistant', 'content': f'Tool execution result: {tool_result_content}'})
-                            response = self.anthropic.messages.create(
-                                max_tokens=2024,
-                                model=self.model_name,
-                                tools=self.available_tools,
-                                messages=messages
-                            )
-                            break
 
-        print(f"Assistant: {full_response}")
+                    tool_id = content.id
+                    tool_name = content.name
+                    tool_args = content.input
+
+                    # Find the server that has this tool
+                    server_name = self.tool_to_server.get(tool_name)
+                    if not server_name:
+                        logging.error(f"Tool {tool_name} not found in any server")
+                        continue
+
+                    # Find the server instance
+                    server = next((s for s in self.servers if s.name == server_name), None)
+                    if not server:
+                        logging.error(f"Server {server_name} not found")
+                        continue
+
+                    # Execute the tool
+                    logging.info(f"Executing tool: {tool_name}")
+                    result = await server.execute_tool(tool_name, tool_args)
+
+                    # Extract URL if this was a web search
+                    if tool_name == "web_search" and result.content:
+                        for result_content in result.content:
+                            if hasattr(result_content, 'text'):
+                                extracted_url = self._extract_url_from_result(result_content.text)
+                                if extracted_url:
+                                    source_url = extracted_url
+                                    break
+
+                    # Append assistant content to conversation history
+                    self.conversation_history.append({
+                        'role': 'assistant',
+                        'content': assistant_content
+                    })
+
+                    # Append tool result to conversation history
+                    self.conversation_history.append({
+                        'role': 'user',
+                        'content': [{
+                            'type': 'tool_result',
+                            'tool_use_id': tool_id,
+                            'content': result.content
+                        }]
+                    })
+
+                    # Call Claude again with the tool result
+                    response = self.anthropic.messages.create(
+                        max_tokens=2024,
+                        model=self.model_name,
+                        system=self.SYSTEM_PROMPT,
+                        tools=self.available_tools,
+                        messages=self.conversation_history
+                    )
+
+                    # Check if the new response is just text
+                    if len(response.content) == 1 and response.content[0].type == 'text':
+                        full_response += response.content[0].text + "\n"
+                        print(response.content[0].text)
+                        # Add this final text response to final_assistant_content
+                        final_assistant_content.append({
+                            'type': 'text',
+                            'text': response.content[0].text
+                        })
+                        process_query = False
+
+                    break  # Break the for loop to process new response
+
+        # Add final assistant response to conversation history if it was text-only
+        # (tool use responses were already added in the loop)
+        if len(final_assistant_content) > 0 and all(c.get('type') == 'text' for c in final_assistant_content):
+            self.conversation_history.append({
+                'role': 'assistant',
+                'content': final_assistant_content
+            })
 
         if self.data_extractor and full_response.strip():
             await self.data_extractor.extract_and_store_data(query, full_response.strip(), source_url)
@@ -373,7 +463,11 @@ class ChatSession:
     async def chat_loop(self) -> None:
         """Run an interactive chat loop."""
         print("\nMCP Chatbot with Data Extraction Started!")
-        print("Type your queries, 'show data' to view stored data, or 'quit' to exit.")
+        print("Commands:")
+        print("  - Type your queries to chat")
+        print("  - 'show data' to view stored pricing data")
+        print("  - 'clear history' to reset conversation context")
+        print("  - 'quit' to exit")
 
         while True:
             try:
@@ -383,6 +477,10 @@ class ChatSession:
                     break
                 elif query.lower() == 'show data':
                     await self.show_stored_data()
+                    continue
+                elif query.lower() == 'clear history':
+                    self.conversation_history = []
+                    print("✓ Conversation history cleared")
                     continue
 
                 await self.process_query(query)
@@ -401,7 +499,6 @@ class ChatSession:
             return
 
         try:
-        # complete
             pricing = await self.sqlite_server.execute_tool("read_query", {
                 "query": "SELECT company_name, plan_name, input_tokens, output_tokens, currency FROM pricing_plans ORDER BY created_at DESC LIMIT 5"
             })
@@ -411,9 +508,12 @@ class ChatSession:
 
             print("\nPricing Plans:")
             # The result.content is a list with one item, a dict, where the 'text' key holds the rows
-            for plan in ast.literal_eval(pricing.content[0].text):
-                print(
-                    f"  • {plan['company_name']}: {plan['plan_name']} - Input Token ${plan['input_tokens']}, Output Tokens ${plan['output_tokens']}")
+            if pricing.content and len(pricing.content) > 0:
+                for plan in pricing.content[0]["text"]:
+                    print(
+                        f"  • {plan['company_name']}: {plan['plan_name']} - Input Token ${plan['input_tokens']}, Output Tokens ${plan['output_tokens']}")
+            else:
+                print("  No data stored yet")
 
             print("=" * 50)
         except Exception as e:
